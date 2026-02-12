@@ -1,0 +1,375 @@
+---
+title: "Modelling Biotic Permeability"
+output:
+  # pdf_document:
+  #   latex_engine: xelatex
+  html_document:
+    code_folding: show
+code_folding: show
+---
+
+**Modelling Biotic Permeability using Interaction Niches**
+
+Biotic permeability represents the balance between biotic potential, arising from positive interactions, and biotic resistance, resulting from negative interactions. Here we operationalize this concept with a trait-based approach that integrates species spatial occurrences, empirical interaction records, and trait data relevant to the focal interactions. We demonstrate the approach for hummingbird species in the Atlatic Forest based on their positive mutualistic interactions with plants (potential) and negative competitive interactions with co-occurring hummingbirds (resistance).
+
+### 1. Environment setup and packages
+
+Load the necessary libraries
+
+```{r setup, include=T, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+rm(list = ls()) # Clean environment 
+
+# Set working directory
+#setwd("")
+
+# Required packages
+library(ggplot2)
+library(ks)
+library(sf)
+library(lattice)
+library(gridExtra)
+library(sjPlot)
+library(terra)
+library(rnaturalearth)
+library(lwgeom)
+library(ggpubr)
+library(viridis)
+library(gstat)
+library(ggrepel)
+library(tidyterra)
+library(patchwork)
+library(RColorBrewer)
+```
+
+### 2. Load, preprocess data and create helper functions
+
+Align the nomenclature across interaction matrices, trait data (PCA), and spatial occurrences
+
+```{r data, include=T, warning=FALSE, message=FALSE}
+# Loading data
+load("data/wide_interaction_matrix.RData") # interaction data
+load('data/pcs_axes.RData') # PCA of plant traits
+load("data/hummingbird_occurrences_spatial.RData") # hummingbird spatial occurrences
+load("data/plant_occurrences_spatial.RData") # plant spatial occurrences
+
+# Alignment and cleaning
+pca_df <- data.frame(sp_faxes_coord_rcapacity)
+
+colnames(species_plant_df) <- gsub("[ -]", "_", colnames(species_plant_df))
+rownames(species_plant_df) <- gsub(" ", "_", rownames(species_plant_df))
+names(occurrences_spatial) <- gsub(" ", "_", names(occurrences_spatial))
+rownames(pca_df) <- gsub(" ", "_", rownames(pca_df))
+
+# Match network and occurrences
+network <- species_plant_df[names(species_plant_df) %in% names(occurrences_spatial_plants_final)]
+humm_names <- rownames(network)
+plant_names <- names(network)
+
+occ_humm <- occurrences_spatial[,match(humm_names, names(occurrences_spatial))]
+occ_plant <- occurrences_spatial_plants_final[,match(plant_names, names(occurrences_spatial_plants_final))]
+
+# Spatial coordinates
+cd <- data.frame(st_coordinates(st_centroid(occ_humm)))
+occ_humm <- data.frame(occ_humm)[,-ncol(occ_humm)]
+occ_plant <- data.frame(occ_plant)[,-ncol(occ_plant)]
+
+# Load the shapefile of the Atlatic Forest from the IBGE
+atl_lim <- st_read("data/biome_border/biome_border.shp")
+atl_lim <- st_transform(atl_lim, crs = 4326)
+
+# Load hummingbird shapefiles from BirdLife
+range_maps_hb = st_read("data/hb_shapefile/Hummingbirds_filtered.shp")
+
+```
+
+Define some utility functions to help query the community structure and interaction partners 
+
+```{r functions, include=T, warning=FALSE, message=FALSE}
+get_com <- function(com, occ) as.numeric(occ[com,])
+get_range <- function(spec, occ) occ[,spec]
+get_plant_partners <- function(humm, network) as.numeric(network[humm,])
+get_humm_partners <- function(plant, network) network[,plant]
+```
+
+### 3. Defining species interaction niches
+
+First, we construct a multidimensional trait space based on traits mediating plant-hummingbird interactions. Next, we construct the interaction niche of each hummingbird species by projecting in this trait space only the plant species with documented interactions with the focal hummingbird. Interaction strength can be used to weight these plant species. A kernel density estimate (KDE) is then fitted to generate a continuous probability surface representing the species-specific interaction niche.
+
+```{r interaction_niche, include=T, warning=FALSE, message=FALSE}
+kernel_list <- list() # Stores the KDE kernel for each bird species
+kernel_eval <- list() # Stores the density estimates for all plants within each bird's kernel
+
+for(k in 1:length(humm_names)){
+  target_sp <- humm_names[k]
+  
+  # Identify plant partners for the current bird species
+  partners <- colnames(species_plant_df)[species_plant_df[target_sp, ] > 0]
+  subset <- which(row.names(pca_df) %in% partners)
+  
+  # Calculate Kernel Density Estimation (KDE) in functional space (PCA)
+  kernel_list[[k]] <- kde(pca_df[subset, ])
+  names(kernel_list[[k]]$cont) <- gsub('%', '', names(kernel_list[[k]]$cont))
+  
+  # Evaluate the bird's kernel at the position of ALL plants in the PCA space
+  kernel_eval[[k]] <- kde(pca_df[subset, ], eval.points = pca_df)
+}
+
+names(kernel_list) <- humm_names
+names(kernel_eval) <- humm_names
+```
+
+### 4. Computing Biotic Potential (BP) and Biotic Resistance (BR)
+
+Biotic potential is quantified by projecting all plant species present in a grid cell into the focal hummingbird’s interaction niche and extracting their KDE-derived probability percentiles, which are then summed. These percentiles are interpreted as measures of how well each plant species matches the hummingbird’s interaction niche. Biotic resistance is quantified as the summed overlap in KDE values between the interaction niche of the focal hummingbird and those of all other hummingbird species co-occurring within the same cell.
+
+```{r resistance_potential, include=T, warning=FALSE, message=FALSE}
+BP = BR = emp_crop = list()
+
+humm_names_selected = c("Amazilia_lactea", "Aphantochroa_cirrochloris", "Chlorostilbon_lucidus", "Clytolaema_rubricauda")
+
+# Bounding box coordinates
+atl_xmin <- -55.33475; atl_xmax <- -28.84777
+atl_ymin <- -29.98127; atl_ymax <- 0.9178872
+
+for(h in 1:length(humm_names_selected)){ 
+  target_sp <- humm_names_selected[h]
+  emp <- get_range(target_sp, occ_humm)
+  
+  spatial_mask <- which(cd$X >= atl_xmin & cd$X <= atl_xmax & 
+                        cd$Y >= atl_ymin & cd$Y <= atl_ymax)
+  
+  cd_crop <- cd[spatial_mask, ]
+  emp_crop[[h]] <- emp[spatial_mask]
+  
+  BP[[h]] <- rep(NA, length(emp_crop[[h]]))
+  BR[[h]] <- rep(NA, length(emp_crop[[h]]))
+  
+  for(i in 1:length(emp_crop[[h]])){
+    cell <- as.numeric(rownames(cd_crop[i, ])) 
+    humm_com <- get_com(cell, occ_humm)  
+    plant_com <- get_com(cell, occ_plant)
+    
+    if(sum(plant_com) > 0){
+      local_plant_list <- plant_names[plant_com > 0]
+      local_plant_pos <- which(rownames(pca_df) %in% local_plant_list)
+      kernel_target <- kernel_list[[target_sp]]
+      kernel_est <- kernel_eval[[target_sp]]
+      
+      # Interaction Probability (intP)
+      intP <- sapply(kernel_est$estimate[local_plant_pos], function(x){
+        as.numeric(names(kernel_target$cont[x >= kernel_target$cont])[1])
+      }) / 100
+      intP <- ifelse(is.na(intP), 0.001, intP)
+      BP[[h]][i] <- sum(intP)
+    } else {BP[[h]][i] <- 0}
+    
+    # Biotic Resistance (Competition)
+    if(sum(humm_com) > 0){
+      local_comp <- humm_names[which(humm_com > 0)] 
+      O <- rep(0, length(local_comp))
+      for (k in 1:length(local_comp)){
+        comp_sp <- local_comp[k] 
+        kernel_comp <- kernel_list[[comp_sp]]
+        kernel_est_comp <- kernel_eval[[comp_sp]]
+        intP_comp <- sapply(kernel_est_comp$estimate[local_plant_pos], function(x){
+          as.numeric(names(kernel_comp$cont[x >= kernel_comp$cont])[1])
+        }) / 100
+        intP_comp <- ifelse(is.na(intP_comp), 0.001, intP_comp)
+        O[k] <- sum(intP * intP_comp) / sum(intP^2)
+        if(O[k] > 1) { O[k] <- 1 }
+      }
+    } else {O <- 0}
+    BR[[h]][i] <- sum(O)
+  }
+}
+names(emp_crop) = names(BP) = names(BR) = humm_names_selected
+```
+
+### 5. Computing Biotic Permeability
+
+Biotic permeability: computed here as $$\exp(-r \times \text{biotic resistance}) - \exp(-p \times \text{biotic potential}),$$. See box 1 fore the methodological opportunities and challenges associated with how to operationalize biotic permeability. For example, here we set scaling parameters for biotic potential and resistance, but these should be biologically or mathematically informed, for example, by being evaluated across a range of parameters to assess sensitivity to the relative strength of resistance and potential
+
+```{r permeability, include=T, warning=FALSE, message=FALSE}
+a = 0.01 
+b = 0.05 
+
+Perm = list()
+for(h in humm_names_selected){
+  Perm[[h]] <- exp(-b * BR[[h]]) - exp(-a * BP[[h]])
+}
+```
+
+### 6. Visualizing how biotic potential and resistance are estimated
+
+Here we illustrate the interaction niche of a target species and how biotic potential was calculated for a site based on the availability of potential mutualistic plant partners. Blue dots represent plant species present in the site, with numbers indicating their KDE-derived probability percentiles within the hummingbird interaction niche. Black dots indicate plant species with empirically recorded interactions (used to define the interaction niche), and grey dots represent all plant species in the dataset.
+
+```{r visualize_niche_potential, fig.width=5, fig.height=5, warning=FALSE, message=FALSE}
+target_sp <- "Amazilia_lactea"
+
+# Subset the species present and their percentile
+kernel_target <- kernel_list[[target_sp]]
+kernel_est <- kernel_eval[[target_sp]]
+names(kernel_target$cont) <- gsub('%','', names(kernel_target$cont))
+intP <- sapply(kernel_est$estimate, function(x){as.numeric(names(kernel_target$cont[x >= kernel_target$cont])[1])})/100
+intP <- ifelse(is.na(intP),0.001,intP)
+plot.pca_subset <- data.frame(pca_df[subset,],intP[subset])
+predict_partners <- sample(1:nrow(pca_df), 5) # Randomly choose potential partners for the plotting example
+plot.pca_predicted <- data.frame(pca_df[predict_partners,],intP[predict_partners])
+
+niche_plot <- ggplot(plot.pca_subset, aes(x = PC1, y = PC2)) +
+  geom_point(data = pca_df, col = 'lightgray', alpha = 0.5, size = 1) + 
+  geom_point(col = 'black', size = 2) + 
+  geom_density_2d(col = 'black') + 
+  geom_point(data = plot.pca_predicted, col = 'blue', alpha = 1, size = 2) + 
+  geom_text_repel(data = plot.pca_predicted, aes(label = intP.predict_partners.), size = 4, box.padding = 0.5, max.overlaps = Inf) +
+  labs(title = bquote("Interaction niche of" ~ italic(.(gsub("_", " ", target_sp)))),
+    subtitle = "Black dots = Confirmed interactions\nBlue dots = Predicted interaction",
+    x = "Plant trait space (PC1)", y = "Plant trait space (PC2)") +
+  theme_minimal(base_size = 14) + 
+  theme(plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 14),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14))
+print(niche_plot)
+```
+
+Here we compare the interaction niche of a target species against two potential competitors in the trait space.
+
+```{r visualize_niche_resistance, fig.width=5, fig.height=5}
+competitor_sp1 <- humm_names_selected[2] 
+competitor_sp2 <- humm_names_selected[4]
+partners <- colnames(species_plant_df)[species_plant_df[target_sp, ] > 0]
+subset_idx <- which(row.names(pca_df) %in% partners)
+plot.pca <- data.frame(pca_df[subset_idx, ])
+
+ggplot(plot.pca, aes(x = PC1, y = PC2)) +
+  geom_point(data = pca_df, col = 'lightgray', alpha = 0.5, size = 1) + 
+  geom_point(col = 'black', size = 2) + 
+  geom_density_2d(col = 'black') + 
+  geom_density_2d(data = as.data.frame(kernel_list[[competitor_sp1]]$x), col = '#B2182B') +
+  geom_density_2d(data = as.data.frame(kernel_list[[competitor_sp2]]$x), col = '#2166AC') +
+  labs(title = bquote("Interaction niche of" ~ italic(.(gsub("_", " ", target_sp)))),
+    subtitle = "Black = Focal species | Red and blue = Potential competitors",
+    x = "Plant trait space (PC1)", 
+    y = "Plant trait space (PC2)") +
+  theme_minimal()
+```
+
+### 7. Mapping biotic resistance, biotic potential and biotic permeability for a species
+
+```{r visualize_map, fig.width=8, fig.height=5, warning=FALSE, message=FALSE}
+atl_v = terra::vect(atl_lim)
+atl_geom = st_geometry(atl_lim)
+br = ne_countries(country = "Brazil", returnclass = "sf")
+br_v = terra::vect(br)
+
+# Define the bounding box for plotting
+bb <- st_bbox(c(xmin = -57, xmax = -26, 
+                ymin = -34, ymax = 0.5), 
+              crs = st_crs(range_maps_hb))
+
+
+# Helper - interpolated raster
+get_interp_raster <- function(x_coords, y_coords, values, mask_poly, res = 0.1) {
+  df <- data.frame(x = x_coords, y = y_coords, z = values)
+  e <- ext(range(x_coords), range(y_coords))
+  r_base <- rast(e, resolution = res)
+  gs_model <- gstat(formula = z ~ 1, locations = ~ x + y, data = df, nmax = 3, set = list(idp = 0))
+  r_interp <- terra::interpolate(r_base, gs_model)[[1]]
+  r_final <- terra::mask(r_interp, mask_poly)
+  return(r_final)
+}
+
+# Helper - bivariate legend
+make_bivariate_legend <- function(a = 0.01, b = 0.05) {
+  legend_data <- expand.grid(
+    BR = seq(0, 5, length.out = 100),    
+    BP = seq(0, 100, length.out = 100))
+  
+  legend_data$Perm <- exp(-b * legend_data$BR) - exp(-a * legend_data$BP)
+  
+  ggplot(legend_data, aes(x = BR, y = BP, fill = Perm)) +
+    geom_raster() +
+    scale_fill_viridis_c(option = "viridis") +
+    scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+    theme_minimal() +
+    labs(x = "Resistance", y = "Potential") +
+    theme(
+      aspect.ratio = 1,
+      axis.title = element_text(size = 7),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "none",
+      plot.background = element_rect(fill = "white", color = "black", linewidth = 0.5) 
+    )
+}
+
+plot_combined_panel <- function(h_idx, atl_v, br_v, range_maps, br_list, bp_list, cd_crop, bbox, a = 0.01, b = 0.05) {
+  sp_name_raw <- h_idx
+  sp_name_clean <- gsub("_", " ", sp_name_raw)
+  
+  # Filter range map and crop to bb
+  hb_range <- range_maps[range_maps$sci_name == sp_name_clean, ]
+  suppressWarnings({hb_range <- st_crop(hb_range, bbox)})
+  
+  # Generate interpolated rasters
+  r_bp <- get_interp_raster(cd_crop$X, cd_crop$Y, bp_list[[sp_name_raw]], atl_v)
+  r_br <- get_interp_raster(cd_crop$X, cd_crop$Y, br_list[[sp_name_raw]], atl_v)
+  
+  # Calculate bivariate raster
+  r_perm <- exp(-b * r_br) - exp(-a * r_bp)
+  names(r_perm) <- "Permeability"
+  
+  # Define common layers
+  common_layers <- list(
+    geom_sf(data = st_as_sf(atl_v), fill = NA, color = "black", linewidth = 0.3),
+    geom_sf(data = st_as_sf(br_v), fill = NA, color = "black", linewidth = 0.3),
+    geom_sf(data = hb_range, fill = NA, color = "#D55E00", linewidth = 0.8),
+    coord_sf(xlim = c(bbox["xmin"], bbox["xmax"]), 
+             ylim = c(bbox["ymin"], bbox["ymax"]), 
+             expand = FALSE), 
+    theme_bw(), theme(axis.title = element_blank(), panel.grid = element_blank(),
+      legend.position = "bottom", plot.title = element_text(size = 12, hjust = 0.5)))
+  
+  # Plot 1: Biotic Potential (BP)
+  p_bp <- ggplot() +
+    geom_spatraster(data = r_bp) +
+    scale_fill_distiller(palette = "YlGn", direction = -1, name = "Potential", na.value = "white") +
+    common_layers +
+    labs(title = "Biotic Potential")
+  
+  # Plot 2: Biotic Resistance (BR)
+  p_br <- ggplot() +
+    geom_spatraster(data = r_br) +
+    scale_fill_distiller(palette = "BuPu", direction = 1, name = "Resistance", na.value = "white") +
+    common_layers +
+    labs(title = "Biotic Resistance")
+  
+  # Plot 3: Bivariate map of Biotic Permeability
+  p_biv_base <- ggplot() +
+    geom_spatraster(data = r_perm) +
+    scale_fill_viridis_c(option = "viridis", na.value = "white") +
+    common_layers +
+    labs(title = "Permeability") +
+    theme(legend.position = "none")
+  
+  # Legend
+  legend_inset <- make_bivariate_legend(a, b)
+  p_biv_final <- p_biv_base + 
+    inset_element(legend_inset, left = 0.02, bottom = 0.60, right = 0.35, top = 0.98, align_to = 'panel')
+  
+  combined_plot <- (p_bp | p_br | p_biv_final) + plot_annotation(title = bquote(italic(.(sp_name_clean))),
+      theme = theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5)))
+
+  return(combined_plot)
+}
+
+final_fig <- plot_combined_panel(h_idx = target_sp,atl_v = atl_v, br_v = br_v, range_maps = range_maps_hb, br_list = BR, bp_list = BP, cd_crop = cd_crop, bbox = bb )
+
+final_fig
+  
+```
